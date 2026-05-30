@@ -1,0 +1,15 @@
+{
+  "feeds": [
+    {
+      "app_id": 1868140,
+      "ignore_patterns": []
+    },
+    {
+      "app_id": 255710,
+      "ignore_patterns": [
+        "Dev Diary"
+      ]
+    }
+  ],
+  "ignore_patterns": []
+}
