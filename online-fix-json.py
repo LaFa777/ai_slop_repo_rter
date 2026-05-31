@@ -344,7 +344,9 @@ async def main():
 
         wm = Watermark.load("online-fix")
         all_articles = new_releases + updates
-        new_articles = wm.filter_new(all_articles, id_key="url")
+        for a in all_articles:
+            a["composite_id"] = f"{a['url']}|||{a['edit_text']}"
+        new_articles = wm.filter_new(all_articles, id_key="composite_id")
 
         if new_articles:
             new_articles = await enrich_articles(new_articles, crawler)
