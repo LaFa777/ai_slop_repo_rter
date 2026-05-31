@@ -45,13 +45,14 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE_URL = "https://online-fix.me/"
+ADDITIONAL_URL = "https://online-fix.me/guides_upd.html"
 SESSION_ID = "ofix"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Фаза 1: Загрузка HTML через Crawl4AI
 # ──────────────────────────────────────────────────────────────────────────────
-async def fetch_html(crawler: AsyncWebCrawler) -> str | None:
+async def fetch_html(crawler: AsyncWebCrawler, url: str = BASE_URL) -> str | None:
     config = CrawlerRunConfig(
         session_id=SESSION_ID,
         cache_mode=CacheMode.BYPASS,
@@ -59,7 +60,7 @@ async def fetch_html(crawler: AsyncWebCrawler) -> str | None:
         page_timeout=60000,
     )
 
-    result = await crawler.arun(url=BASE_URL, config=config)
+    result = await crawler.arun(url=url, config=config)
 
     if not result.success:
         print(f"Ошибка загрузки: {result.error_message}", file=sys.stderr)
@@ -84,9 +85,9 @@ def extract_articles(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     articles: list[dict] = []
 
-    for article_tag in soup.find_all("article", class_="news"):
+    for article_tag in soup.find_all(["article", "div"], class_="news"):
         # ---- заголовок + ссылка ----
-        title_tag = article_tag.find("h2", class_="title")
+        title_tag = article_tag.find(["h2", "span"], class_="title")
         if not title_tag:
             continue
 
@@ -211,7 +212,7 @@ def build_json_output(new_releases: list[dict], updates: list[dict]) -> str:
         }
 
     output = {
-        "source": BASE_URL,
+        "source": [BASE_URL, ADDITIONAL_URL],
         "scraped_at": now,
         "new_releases": [article_dict(a) for a in new_releases],
         "updates": [article_dict(a) for a in updates],
@@ -324,12 +325,17 @@ async def main():
     )
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        html = await fetch_html(crawler)
-        if not html:
-            print('{"error": "Не удалось загрузить страницу."}', file=sys.stderr)
+        html1 = await fetch_html(crawler, BASE_URL)
+        html2 = await fetch_html(crawler, ADDITIONAL_URL)
+        if not html1 and not html2:
+            print('{"error": "Не удалось загрузить ни одну страницу."}', file=sys.stderr)
             sys.exit(1)
 
-        articles = extract_articles(html)
+        articles = []
+        if html1:
+            articles.extend(extract_articles(html1))
+        if html2:
+            articles.extend(extract_articles(html2))
         if not articles:
             print('{"error": "Не найдено ни одной статьи."}', file=sys.stderr)
             sys.exit(1)
