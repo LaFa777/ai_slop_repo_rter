@@ -12,17 +12,33 @@
 online-fix-json.py — Scraper для https://online-fix.me/ в формате JSON
 
 Фазы:
-  Фаза 1: Сбор HTML главной страницы через Crawl4AI (AsyncWebCrawler)
-  Фаза 2: Парсинг HTML через BeautifulSoup — извлечение всех статей
+  Фаза 1: Сбор RSS-лент через requests.get
+  Фаза 2: Парсинг RSS XML через ElementTree + BeautifulSoup для извлечения item'ов
   Фаза 3: Фильтрация по кооперативу — оставляем только игры с "fa-check"
-  Фаза 4: Категоризация — "Новые релизы" vs "Обновления" по содержимому <div class="edit">
+  Фаза 4: Категоризация по источнику: export_rookovodstva.xml → "Новые релизы",
+          export_updrookovodstva.xml → "Обновления"
   Фаза 5: Сериализация в JSON (плоский формат)
   Фаза 6: Обогащение — для каждой новой статьи загружается полная страница,
            извлекаются game_info и store_url. Steam-ссылка раскрывается через
            Crawl4AI: клик по /ext/, переход на интерстициал, парсинг URL из HTML
 
-Использование:
+Запуск:
   cd repo_rter && uv run online-fix-json.py
+
+Отладка (повторный запуск):
+  Watermark запоминает обработанные статьи и не выводит их повторно.
+  Чтобы сбросить и прогнать всё заново:
+
+    # PowerShell:
+    @'
+    {
+      "first_run": false,
+      "seen_ids": []
+    }
+    '@ | Set-Content states/online-fix.json -Encoding utf8
+
+    # или просто удалить файл:
+    Remove-Item states/online-fix.json
 """
 
 import asyncio
@@ -30,10 +46,11 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 os.environ["CRAWL4AI_LOG_LEVEL"] = "ERROR"
 
@@ -44,138 +61,101 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+NEW_RELEASES_FEED = "https://online-fix.me/export_rookovodstva.xml"
+UPDATES_FEED = "https://online-fix.me/export_updrookovodstva.xml"
 BASE_URL = "https://online-fix.me/"
-ADDITIONAL_URL = "https://online-fix.me/guides_upd.html"
 SESSION_ID = "ofix"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Фаза 1: Загрузка HTML через Crawl4AI
+# Фаза 1: Загрузка RSS-ленты через requests
 # ──────────────────────────────────────────────────────────────────────────────
-async def fetch_html(crawler: AsyncWebCrawler, url: str = BASE_URL) -> str | None:
-    config = CrawlerRunConfig(
-        session_id=SESSION_ID,
-        cache_mode=CacheMode.BYPASS,
-        remove_overlay_elements=True,
-        page_timeout=60000,
-    )
-
-    result = await crawler.arun(url=url, config=config)
-
-    if not result.success:
-        print(f"Ошибка загрузки: {result.error_message}", file=sys.stderr)
+async def fetch_rss(url: str) -> bytes | None:
+    try:
+        resp = await asyncio.to_thread(requests.get, url, timeout=15)
+        resp.raise_for_status()
+        return resp.content
+    except requests.RequestException as e:
+        print(f"Ошибка загрузки RSS {url}: {e}", file=sys.stderr)
         return None
 
-    return result.html
-
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Фаза 2: Парсинг HTML — извлечение статей
+# Фаза 2: Парсинг RSS-ленты — извлечение статей
 # ──────────────────────────────────────────────────────────────────────────────
-def extract_articles(html: str) -> list[dict]:
+def parse_rss_feed(xml_data: bytes, feed_type: str) -> list[dict]:
     """
-    Извлекает из HTML все <article class="news">.
-    Для каждой статьи собирает:
-      - url          (ссылка из заголовка)
-      - title        (текст h2.title)
-      - edit_text    (содержимое div.edit)
-      - edit_is_nbsp (True, если edit содержит только пробелы/&nbsp;)
+    Парсит RSS-ленту и извлекает <item> элементы.
+    feed_type: "new_release" — из export_rookovodstva.xml
+               "update"     — из export_updrookovodstva.xml
+
+    Для каждого item собирает:
+      - url          (ссылка из <link>)
+      - title        (текст <title>)
       - has_coop     (True, если Кооператив помечен fa-check)
+      - has_coop_times
+      - feed_type    (new_release / update)
     """
-    soup = BeautifulSoup(html, "html.parser")
+    root = ET.fromstring(xml_data)
+    channel = root.find("channel")
+    if channel is None:
+        return []
+
     articles: list[dict] = []
 
-    for article_tag in soup.find_all(["article", "div"], class_="news"):
-        # ---- заголовок + ссылка ----
-        title_tag = article_tag.find(["h2", "span"], class_="title")
-        if not title_tag:
+    for item in channel.findall("item"):
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+
+        if title_el is None or link_el is None:
             continue
 
-        # Ссылка — родительский <a> вокруг h2
-        link_tag = title_tag.find_parent("a")
-        url = str(link_tag["href"]) if link_tag and link_tag.get("href") else ""
+        url = (link_el.text or "").strip()
         if not url:
             continue
 
-        raw_title = title_tag.get_text(strip=True)
+        raw_title = (title_el.text or "").strip()
 
-        # ---- div.edit ----
-        edit_tag = article_tag.find("div", class_="edit")
-        edit_text = edit_tag.get_text(strip=True) if edit_tag else ""
-        edit_is_nbsp = _is_nbsp_only(edit_tag)
-
-        # ---- Кооператив fa-check / fa-times ----
+        # ---- Кооператив fa-check / fa-times из description CDATA ----
         has_coop = False
         has_coop_times = False
 
-        preview = article_tag.find("div", class_="preview-text")
-        if preview:
-            # Ищем текст "Кооператив" и берём следующий за ним span
-            for text_node in preview.find_all(string=True):
-                parent = text_node.parent
-                if parent and "Кооператив" in parent.get_text():
-                    # Ищем span.fa-check или span.fa-times внутри этого родителя
-                    coop_span = parent.find_next("span", class_=re.compile(r"fa-"))
-                    if coop_span:
-                        classes = coop_span.get("class", [])
+        if desc_el is not None and desc_el.text:
+            desc_html = desc_el.text.strip()
+            desc_soup = BeautifulSoup(desc_html, "html.parser")
+            for b_tag in desc_soup.find_all("b"):
+                if "режим" in b_tag.get_text().lower():
+                    span = b_tag.find_next("span", class_=re.compile(r"fa-"))
+                    if span:
+                        classes = span.get("class", [])
                         if "fa-check" in classes:
                             has_coop = True
                         elif "fa-times" in classes:
                             has_coop_times = True
                     break
 
-        articles.append(
-            {
-                "url": url,
-                "title": raw_title,
-                "edit_text": edit_text,
-                "edit_is_nbsp": edit_is_nbsp,
-                "has_coop": has_coop,
-                "has_coop_times": has_coop_times,
-            }
-        )
+        articles.append({
+            "url": url,
+            "title": raw_title,
+            "has_coop": has_coop,
+            "has_coop_times": has_coop_times,
+            "feed_type": feed_type,
+        })
 
     return articles
 
 
-def _is_nbsp_only(edit_tag: Tag | None) -> bool:
-    """
-    Проверяет, что div.edit содержит ТОЛЬКО &nbsp; или пробелы.
-    Если есть хоть один настоящий символ (кириллица, латиница, цифра)
-    — значит это обновление.
-    """
-    if edit_tag is None:
-        return True
-
-    text = edit_tag.get_text(strip=True)
-    # После strip() &nbsp; превращается в пустую строку
-    # Если есть хоть один буквенный или цифровой символ — это обновление
-    return not bool(re.search(r"[a-zA-Zа-яА-ЯёЁ0-9]", text))
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Фаза 3 + 4: Фильтрация по кооперативу и категоризация
+# Фаза 3+4: Фильтрация по кооперативу + категоризация
 # ──────────────────────────────────────────────────────────────────────────────
-def categorize_articles(
-    articles: list[dict],
-) -> tuple[list[dict], list[dict]]:
+def filter_coop_only(articles: list[dict]) -> list[dict]:
     """
-    Фаза 3 — фильтр по кооперативу.
+    Фильтр по кооперативу.
       has_coop=True (fa-check) → оставляем
       has_coop=False или has_coop_times=True → удаляем
-
-    Фаза 4 — категоризация.
-      edit_is_nbsp=True  → "Новые релизы"
-      edit_is_nbsp=False → "Обновления"
     """
-    # Фаза 3: только с кооперативом fa-check
-    coop_only = [a for a in articles if a["has_coop"] and not a["has_coop_times"]]
-
-    # Фаза 4: разделение
-    new_releases = [a for a in coop_only if a["edit_is_nbsp"]]
-    updates = [a for a in coop_only if not a["edit_is_nbsp"]]
-
-    return new_releases, updates
+    return [a for a in articles if a["has_coop"] and not a["has_coop_times"]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -203,8 +183,6 @@ def build_json_output(new_releases: list[dict], updates: list[dict]) -> str:
         return {
             "title": strip_po_seti(a["title"]),
             "url": _abs_url(a["url"]),
-            "edit_text": a["edit_text"],
-            "edit_is_nbsp": a["edit_is_nbsp"],
             "has_coop": a["has_coop"],
             "has_coop_times": a["has_coop_times"],
             "game_info": a.get("game_info", ""),
@@ -212,7 +190,7 @@ def build_json_output(new_releases: list[dict], updates: list[dict]) -> str:
         }
 
     output = {
-        "source": [BASE_URL, ADDITIONAL_URL],
+        "source": [NEW_RELEASES_FEED, UPDATES_FEED],
         "scraped_at": now,
         "new_releases": [article_dict(a) for a in new_releases],
         "updates": [article_dict(a) for a in updates],
@@ -318,37 +296,35 @@ async def enrich_articles(articles: list[dict], crawler: AsyncWebCrawler) -> lis
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 async def main():
-    browser_config = BrowserConfig(
-        headless=True,
-        viewport_width=1920,
-        viewport_height=1080,
-    )
+    xml1 = await fetch_rss(NEW_RELEASES_FEED)
+    xml2 = await fetch_rss(UPDATES_FEED)
+    if not xml1 and not xml2:
+        print('{"error": "Не удалось загрузить ни одну RSS-ленту."}', file=sys.stderr)
+        sys.exit(1)
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        html1 = await fetch_html(crawler, BASE_URL)
-        html2 = await fetch_html(crawler, ADDITIONAL_URL)
-        if not html1 and not html2:
-            print('{"error": "Не удалось загрузить ни одну страницу."}', file=sys.stderr)
-            sys.exit(1)
+    new_releases = parse_rss_feed(xml1, "new_release") if xml1 else []
+    updates = parse_rss_feed(xml2, "update") if xml2 else []
 
-        articles = []
-        if html1:
-            articles.extend(extract_articles(html1))
-        if html2:
-            articles.extend(extract_articles(html2))
-        if not articles:
-            print('{"error": "Не найдено ни одной статьи."}', file=sys.stderr)
-            sys.exit(1)
+    new_releases = filter_coop_only(new_releases)
+    updates = filter_coop_only(updates)
 
-        new_releases, updates = categorize_articles(articles)
+    if not new_releases and not updates:
+        print('{"error": "Не найдено ни одной статьи с кооперативом."}', file=sys.stderr)
+        sys.exit(1)
 
-        wm = Watermark.load("online-fix")
-        all_articles = new_releases + updates
-        for a in all_articles:
-            a["composite_id"] = f"{a['url']}|||{a['edit_text']}"
-        new_articles = wm.filter_new(all_articles, id_key="composite_id")
+    wm = Watermark.load("online-fix")
+    all_articles = new_releases + updates
+    for a in all_articles:
+        a["composite_id"] = f"{a['url']}|||{a['feed_type']}"
+    new_articles = wm.filter_new(all_articles, id_key="composite_id")
 
-        if new_articles:
+    if new_articles:
+        browser_config = BrowserConfig(
+            headless=True,
+            viewport_width=1920,
+            viewport_height=1080,
+        )
+        async with AsyncWebCrawler(config=browser_config) as crawler:
             new_articles = await enrich_articles(new_articles, crawler)
             new_release_urls = {a["url"] for a in new_releases}
             new_new = [a for a in new_articles if a["url"] in new_release_urls]
@@ -356,7 +332,7 @@ async def main():
             output = build_json_output(new_new, new_upd)
             print(output)
 
-        wm.save()
+    wm.save()
 
 
 if __name__ == "__main__":
